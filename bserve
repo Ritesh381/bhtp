@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""bserve — a BHTP/1 static file server.
+
+    ./bserve ./www 9000
+
+One process per connection via fork(), the way Apache did it before threads.
+Set BHTP_NO_FORK=1 to serve in a single process, which is easier to debug.
+"""
+
+import os
+import signal
+import socket
+import struct
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from bhtp import frame as F
+from bhtp import hpack
+from bhtp.hexdump import dump_frame
+
+CONTENT_TYPES = {
+    ".html": b"text/html; charset=utf-8",
+    ".htm": b"text/html; charset=utf-8",
+    ".txt": b"text/plain; charset=utf-8",
+    ".css": b"text/css",
+    ".js": b"application/javascript",
+    ".json": b"application/json",
+    ".png": b"image/png",
+    ".jpg": b"image/jpeg",
+    ".jpeg": b"image/jpeg",
+    ".gif": b"image/gif",
+    ".svg": b"image/svg+xml",
+    ".ico": b"image/x-icon",
+    ".pdf": b"application/pdf",
+    ".bin": b"application/octet-stream",
+}
+DEFAULT_TYPE = b"application/octet-stream"
+
+VERBOSE = os.environ.get("BHTP_VERBOSE") == "1"
+
+
+def log(message):
+    sys.stderr.write("[bserve %d] %s\n" % (os.getpid(), message))
+    sys.stderr.flush()
+
+
+def etag_for(stat):
+    """mtime-and-size validator, the same shape nginx uses.
+
+    A strong validator over an identity: cheap to compute, survives clock
+    skew between the two machines (which Last-Modified does not), and
+    changes whenever the bytes do.
+    """
+    return ("%x-%x" % (int(stat.st_mtime), stat.st_size)).encode()
+
+
+class Connection:
+    def __init__(self, sock, root):
+        self.sock = sock
+        self.root = root
+        self.encoder = hpack.Encoder()
+        self.decoder = hpack.Decoder()
+        self.reader = F.FrameReader(sock, F.DEFAULT_MAX_FRAME_SIZE)
+        self.peer_max_frame = F.DEFAULT_MAX_FRAME_SIZE
+        self.requests = 0
+
+    # -- plumbing ---------------------------------------------------------
+
+    def send(self, raw, note=None):
+        F.send_all(self.sock, raw)
+        if VERBOSE and note:
+            log(note)
+
+    def send_frame(self, type_, flags, stream, payload=b""):
+        self.send(F.pack_frame(type_, flags, stream, payload))
+
+    def dump(self, direction, fr, fields=None):
+        if VERBOSE:
+            log(dump_frame(direction, fr, fields))
+
+    # -- lifecycle --------------------------------------------------------
+
+    def run(self):
+        preface = F.recv_exactly(self.sock, len(F.MAGIC))
+        if preface is None:
+            return  # client connected and left without saying anything
+        if preface != F.MAGIC:
+            log("preface mismatch: %r" % preface[:16])
+            self.send(F.pack_goaway(F.ERR_VERSION_MISMATCH, "expected BHTP/1 preface"))
+            return
+
+        self.send(
+            F.pack_settings(
+                {
+                    F.SETTING_MAX_FRAME_SIZE: F.DEFAULT_MAX_FRAME_SIZE,
+                    F.SETTING_MAX_TABLE_ENTRIES: hpack.MAX_TABLE_ENTRIES,
+                    F.SETTING_MAX_CONCURRENT_STREAMS: 100,
+                }
+            )
+        )
+
+        while True:
+            fr = self.reader.read_frame()
+            if fr is None:
+                break
+            if not self.dispatch(fr):
+                break
+
+    def dispatch(self, fr):
+        """True to keep the connection open."""
+        if fr.type == F.TYPE_HEADERS:
+            self.handle_request(fr)
+            return True
+        if fr.type == F.TYPE_DATA:
+            # No request bodies in v1. Consume and ignore, per Postel.
+            self.dump("<<<", fr)
+            return True
+        if fr.type == F.TYPE_SETTINGS:
+            self.dump("<<<", fr)
+            if not fr.has(F.FLAG_ACK):
+                settings = F.parse_settings(fr.payload)
+                peer_max = settings.get(F.SETTING_MAX_FRAME_SIZE)
+                if peer_max:
+                    self.peer_max_frame = max(1, min(peer_max, F.HARD_MAX_FRAME_SIZE))
+                self.send(F.pack_settings({}, ack=True))
+            return True
+        if fr.type == F.TYPE_GOAWAY:
+            self.dump("<<<", fr)
+            return False
+        # The rule that leaves room for a version 2: length was already
+        # consumed by the reader, so there is nothing left to do but say so.
+        log("skipped unknown frame type 0x%02x (%d bytes discarded)" % (fr.type, len(fr.payload)))
+        self.dump("<<<", fr)
+        return True
+
+    # -- request handling -------------------------------------------------
+
+    def handle_request(self, fr):
+        self.requests += 1
+        # A header block we cannot decode is connection-level: our dynamic
+        # table and the peer's encoder have already diverged, so there is no
+        # honest way to carry on. Everything below this line is request-level
+        # and answers on the stream with the connection left open.
+        fields = self.decoder.decode(fr.payload)
+        self.dump("<<<", fr, fields)
+
+        method = hpack.find(fields, b":method")
+        raw_path = hpack.find(fields, b":path")
+
+        if method is None or raw_path is None:
+            return self.respond_error(fr.stream, F.ERR_MALFORMED, "missing :method or :path")
+        if method != b"GET":
+            return self.respond_error(fr.stream, F.ERR_METHOD_NOT_ALLOWED, "only GET in v1")
+
+        path = self.resolve(raw_path)
+        if path is None:
+            return self.respond_error(fr.stream, F.ERR_NOT_FOUND, "no such resource")
+
+        try:
+            stat = os.stat(path)
+            handle = open(path, "rb")
+        except OSError:
+            return self.respond_error(fr.stream, F.ERR_NOT_FOUND, "no such resource")
+
+        etag = etag_for(stat)
+        if hpack.find(fields, b"if-none-match") == etag:
+            handle.close()
+            return self.respond_not_modified(fr.stream, etag)
+
+        with handle:
+            size = stat.st_size
+            ctype = CONTENT_TYPES.get(os.path.splitext(path)[1].lower(), DEFAULT_TYPE)
+            self.respond_headers(
+                fr.stream, 200, ctype, size, etag=etag, end_stream=(size == 0)
+            )
+            remaining = size
+            while remaining > 0:
+                chunk = handle.read(min(self.peer_max_frame, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                flags = F.FLAG_END_STREAM if remaining == 0 else 0
+                data = F.Frame(F.TYPE_DATA, flags, fr.stream, chunk)
+                self.send(data.header_bytes() + chunk)
+                self.dump(">>>", data)
+
+    def resolve(self, raw_path):
+        """Map a request path to a real file under root, or None."""
+        text = raw_path.decode("utf-8", "replace").split("?", 1)[0].split("#", 1)[0]
+        if not text.startswith("/"):
+            return None
+        candidate = os.path.realpath(os.path.join(self.root, text.lstrip("/")))
+        # Containment check. Nothing outside root is ever served, whatever
+        # number of ../ segments the request contains.
+        if candidate != self.root and not candidate.startswith(self.root + os.sep):
+            return None
+        if os.path.isdir(candidate):
+            candidate = os.path.join(candidate, "index.html")
+        if not os.path.isfile(candidate):
+            return None
+        return candidate
+
+    def send_headers(self, stream, fields, end_stream=False):
+        payload = self.encoder.encode(fields)
+        flags = F.FLAG_END_HEADERS | (F.FLAG_END_STREAM if end_stream else 0)
+        fr = F.Frame(F.TYPE_HEADERS, flags, stream, payload)
+        self.send(fr.header_bytes() + payload)
+        self.dump(">>>", fr, fields)
+
+    def respond_headers(self, stream, status, ctype, length, etag=None, end_stream=False):
+        fields = [
+            (b":status", struct.pack(">H", status)),
+            (b"content-type", ctype),
+            (b"content-length", struct.pack(">I", length)),
+        ]
+        if etag is not None:
+            fields.append((b"etag", etag))
+        self.send_headers(stream, fields, end_stream=end_stream)
+
+    def respond_not_modified(self, stream, etag):
+        """304: the validator matched, so the body is the client's own copy."""
+        self.send_headers(
+            stream,
+            [(b":status", struct.pack(">H", 304)), (b"etag", etag)],
+            end_stream=True,
+        )
+
+    def respond_error(self, stream, status, reason):
+        body = ("%d %s\n" % (status, reason)).encode()
+        self.respond_headers(stream, status, b"text/plain; charset=utf-8", len(body))
+        fr = F.Frame(F.TYPE_DATA, F.FLAG_END_STREAM, stream, body)
+        self.send(fr.header_bytes() + body)
+        self.dump(">>>", fr)
+
+
+def serve_connection(sock, addr, root):
+    try:
+        Connection(sock, root).run()
+    except F.ProtocolError as exc:
+        log("protocol error from %s: %s" % (addr[0], exc))
+        try:
+            F.send_all(sock, F.pack_goaway(exc.code, exc.reason))
+        except OSError:
+            pass
+    except (ConnectionResetError, BrokenPipeError):
+        log("client %s disconnected mid-exchange" % addr[0])
+    except OSError as exc:
+        log("socket error with %s: %s" % (addr[0], exc))
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+
+def main(argv):
+    if len(argv) != 3:
+        sys.stderr.write("usage: bserve <root> <port>\n")
+        return 2
+    root = os.path.realpath(argv[1])
+    if not os.path.isdir(root):
+        sys.stderr.write("bserve: %s is not a directory\n" % argv[1])
+        return 2
+    port = int(argv[2])
+
+    # A client that hangs up mid-transfer must not kill the server.
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+    no_fork = os.environ.get("BHTP_NO_FORK") == "1"
+    if not no_fork:
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # no zombies
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", port))
+    listener.listen(128)
+    log("serving %s on port %d%s" % (root, port, " (single process)" if no_fork else ""))
+
+    accepted = 0
+    try:
+        while True:
+            try:
+                sock, addr = listener.accept()
+            except InterruptedError:
+                continue
+            accepted += 1
+            log("accepted connection #%d from %s:%d" % (accepted, addr[0], addr[1]))
+            if no_fork:
+                serve_connection(sock, addr, root)
+                continue
+            pid = os.fork()
+            if pid == 0:
+                listener.close()
+                serve_connection(sock, addr, root)
+                os._exit(0)
+            sock.close()
+    except KeyboardInterrupt:
+        log("shutting down after %d connection(s)" % accepted)
+    finally:
+        listener.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

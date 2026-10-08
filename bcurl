@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""bcurl — a BHTP/1 client.
+
+    ./bcurl -v localhost:9000/index.html
+
+Options
+    -v          hexdump every frame in both directions, to stderr
+    -p          pipeline: send every request before reading any response
+    -r          after fetching, re-request with if-none-match and show the 304
+    --stats     print header-block sizes to stderr (shows the table working)
+    -o FILE     write bodies to FILE instead of stdout
+
+Body bytes go to stdout untouched, so `./bcurl host:port/logo.png > out.png`
+is byte-exact. Exactly one TCP connection is opened, ever.
+"""
+
+import os
+import socket
+import struct
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from bhtp import frame as F
+from bhtp import hpack
+from bhtp.hexdump import dump_frame
+
+USER_AGENT = b"bcurl/1.0 (BHTP/1)"
+ACCEPT_ENCODING = b"identity"
+
+
+def die(message, code=2):
+    sys.stderr.write("bcurl: %s\n" % message)
+    sys.exit(code)
+
+
+def parse_target(target):
+    """'localhost:9000/index.html' -> ('localhost', 9000, '/index.html')"""
+    if "://" in target:
+        scheme, target = target.split("://", 1)
+        if scheme not in ("bhtp", "http"):
+            die("unsupported scheme %r" % scheme)
+    slash = target.find("/")
+    if slash == -1:
+        authority, path = target, "/"
+    else:
+        authority, path = target[:slash], target[slash:]
+    if ":" not in authority:
+        die("target must be host:port[/path], got %r" % target)
+    host, _, port = authority.rpartition(":")
+    try:
+        port = int(port)
+    except ValueError:
+        die("bad port in %r" % target)
+    return host, port, path
+
+
+class Client:
+    def __init__(self, sock, verbose=False, stats=False):
+        self.sock = sock
+        self.verbose = verbose
+        self.stats = stats
+        self.encoder = hpack.Encoder()
+        self.decoder = hpack.Decoder()
+        self.reader = F.FrameReader(sock, F.DEFAULT_MAX_FRAME_SIZE)
+        self.peer_max_frame = F.DEFAULT_MAX_FRAME_SIZE
+        self.bodies = {}
+        self.statuses = {}
+        self.etags = {}
+        self.done = set()
+
+    def trace(self, text):
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
+
+    def dump(self, direction, fr, fields=None):
+        if self.verbose:
+            self.trace(dump_frame(direction, fr, fields))
+
+    def send_frame(self, fr, fields=None):
+        F.send_all(self.sock, fr.header_bytes() + fr.payload)
+        self.dump(">>>", fr, fields)
+
+    def open(self, host):
+        F.send_all(self.sock, F.MAGIC)
+        if self.verbose:
+            self.trace(">>> PREFACE %r (%d bytes)" % (F.MAGIC, len(F.MAGIC)))
+        self.send_frame(
+            F.Frame(
+                F.TYPE_SETTINGS,
+                0,
+                0,
+                F.settings_payload(
+                    {
+                        F.SETTING_MAX_FRAME_SIZE: F.DEFAULT_MAX_FRAME_SIZE,
+                        F.SETTING_MAX_TABLE_ENTRIES: hpack.MAX_TABLE_ENTRIES,
+                    }
+                ),
+            )
+        )
+        self.host = host.encode()
+
+    def request(self, stream, path, if_none_match=None):
+        fields = [
+            (b":method", b"GET"),
+            (b":path", path.encode()),
+            (b"host", self.host),
+            (b"user-agent", USER_AGENT),
+            (b"accept-encoding", ACCEPT_ENCODING),
+        ]
+        if if_none_match is not None:
+            fields.append((b"if-none-match", if_none_match))
+        payload = self.encoder.encode(fields)
+        if self.stats:
+            self.trace("stats stream=%d header_block=%d" % (stream, len(payload)))
+        self.send_frame(
+            F.Frame(
+                F.TYPE_HEADERS,
+                F.FLAG_END_HEADERS | F.FLAG_END_STREAM,
+                stream,
+                payload,
+            ),
+            fields,
+        )
+        self.bodies[stream] = bytearray()
+
+    def pump_until(self, wanted):
+        """Read frames until every stream in `wanted` has ended."""
+        while not wanted.issubset(self.done):
+            fr = self.reader.read_frame()
+            if fr is None:
+                raise F.ProtocolError(
+                    F.ERR_MALFORMED, "server closed before the response ended"
+                )
+            self.handle(fr)
+
+    def handle(self, fr):
+        if fr.type == F.TYPE_HEADERS:
+            fields = self.decoder.decode(fr.payload)
+            self.dump("<<<", fr, fields)
+            raw = hpack.find(fields, b":status")
+            if raw is None or len(raw) != 2:
+                raise F.ProtocolError(F.ERR_MALFORMED, ":status missing or not 2 bytes")
+            self.statuses[fr.stream] = struct.unpack(">H", raw)[0]
+            tag = hpack.find(fields, b"etag")
+            if tag is not None:
+                self.etags[fr.stream] = tag
+            if fr.has(F.FLAG_END_STREAM):
+                self.done.add(fr.stream)
+            return
+        if fr.type == F.TYPE_DATA:
+            self.dump("<<<", fr)
+            self.bodies.setdefault(fr.stream, bytearray()).extend(fr.payload)
+            if fr.has(F.FLAG_END_STREAM):
+                self.done.add(fr.stream)
+            return
+        if fr.type == F.TYPE_SETTINGS:
+            self.dump("<<<", fr)
+            if not fr.has(F.FLAG_ACK):
+                peer_max = F.parse_settings(fr.payload).get(F.SETTING_MAX_FRAME_SIZE)
+                if peer_max:
+                    self.peer_max_frame = max(1, min(peer_max, F.HARD_MAX_FRAME_SIZE))
+                self.send_frame(F.Frame(F.TYPE_SETTINGS, F.FLAG_ACK, 0, b""))
+            return
+        if fr.type == F.TYPE_GOAWAY:
+            self.dump("<<<", fr)
+            code, reason = F.parse_goaway(fr.payload)
+            raise F.ProtocolError(code, reason or "server sent GOAWAY")
+        # Unknown type: the reader already consumed its length. Carry on.
+        self.dump("<<<", fr)
+        if self.verbose:
+            self.trace("    . skipped cleanly, connection still usable")
+
+    def close(self):
+        try:
+            F.send_all(self.sock, F.pack_goaway(0, "done"))
+        except OSError:
+            pass
+
+
+def main(argv):
+    verbose = False
+    pipeline = False
+    revalidate = False
+    stats = False
+    out_path = None
+    targets = []
+
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-v":
+            verbose = True
+        elif arg == "-p":
+            pipeline = True
+        elif arg == "-r":
+            revalidate = True
+        elif arg == "--stats":
+            stats = True
+        elif arg == "-o":
+            i += 1
+            if i >= len(args):
+                die("-o needs a filename")
+            out_path = args[i]
+        elif arg in ("-h", "--help"):
+            sys.stderr.write(__doc__)
+            return 0
+        elif arg.startswith("-") and arg != "-":
+            die("unknown option %r" % arg)
+        else:
+            targets.append(arg)
+        i += 1
+
+    if not targets:
+        sys.stderr.write(__doc__)
+        return 2
+
+    host, port, first_path = parse_target(targets[0])
+    paths = [first_path]
+    for extra in targets[1:]:
+        if "/" in extra and not extra.startswith("/"):
+            h, p, path = parse_target(extra)
+            if (h, p) != (host, port):
+                die("every target must share one host:port — a second connection "
+                    "is not allowed")
+            paths.append(path)
+        else:
+            paths.append(extra if extra.startswith("/") else "/" + extra)
+
+    try:
+        sock = socket.create_connection((host, port), timeout=30)
+    except OSError as exc:
+        die("cannot connect to %s:%d — %s" % (host, port, exc), 3)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    client = Client(sock, verbose=verbose, stats=stats)
+    sink = open(out_path, "wb") if out_path else sys.stdout.buffer
+    exit_code = 0
+
+    try:
+        client.open(host)
+        streams = [1 + 2 * n for n in range(len(paths))]
+
+        if pipeline:
+            for stream, path in zip(streams, paths):
+                client.request(stream, path)
+            client.pump_until(set(streams))
+        else:
+            for stream, path in zip(streams, paths):
+                client.request(stream, path)
+                client.pump_until({stream})
+
+        for stream, path in zip(streams, paths):
+            status = client.statuses.get(stream, 0)
+            body = bytes(client.bodies.get(stream, b""))
+            if verbose:
+                client.trace(
+                    "--- stream %d  %s  status %d  %d body bytes"
+                    % (stream, path, status, len(body))
+                )
+            sink.write(body)
+            if 400 <= status < 500:
+                exit_code = max(exit_code, 1)
+            elif status >= 500:
+                exit_code = max(exit_code, 2)
+        sink.flush()
+
+        if revalidate:
+            # Same connection, same resources, this time carrying the
+            # validator the server just handed us.
+            next_stream = streams[-1] + 2
+            for original, path in zip(streams, paths):
+                tag = client.etags.get(original)
+                if tag is None:
+                    client.trace("revalidate %s: server sent no etag, skipped" % path)
+                    continue
+                client.request(next_stream, path, if_none_match=tag)
+                client.pump_until({next_stream})
+                status = client.statuses.get(next_stream, 0)
+                body = bytes(client.bodies.get(next_stream, b""))
+                client.trace(
+                    "revalidate %s  etag=%s  status %d  %d body bytes"
+                    % (path, tag.decode("ascii", "replace"), status, len(body))
+                )
+                if status >= 400:
+                    exit_code = max(exit_code, 1 if status < 500 else 2)
+                next_stream += 2
+
+        client.close()
+    except F.ProtocolError as exc:
+        sys.stderr.write("bcurl: protocol error: %s\n" % exc)
+        exit_code = 3
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        sys.stderr.write("bcurl: connection lost: %s\n" % exc)
+        exit_code = 3
+    finally:
+        if out_path:
+            sink.close()
+        sock.close()
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,5 @@
+# Regenerate with: python3 tests/make-fixtures.py
+www/big.bin
+
+__pycache__/
+*.pyc
